@@ -8,14 +8,15 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import threading
 import time
 from collections import Counter, OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from . import api
+from . import adfilter, api
 from .cbz import CbzWriter, comic_info, safe_name
 
 Chapter = Dict[str, Any]
@@ -148,6 +149,7 @@ class Job:
     volume: Optional[str] = None   # set for volume bundles
     pages: int = field(default=0)  # expected page count
     cover_url: Optional[str] = None  # volume cover, written as the first page
+    removed: int = 0                 # credit/ad pages left out
 
     @property
     def exists(self) -> bool:
@@ -210,6 +212,10 @@ def plan_jobs(series: Series, chapters: List[Chapter], out_root: str, bundle: st
 PageCallback = Callable[[Chapter, int, int, int, str, bytes], None]
 # on_page(chapter, pages_done, pages_total, page_index, extension, data)
 
+PAGE_CACHE = os.path.expanduser("~/.cache/mangadex-dl/pages")
+RemoveMap = Dict[str, Set[str]]  # chapter id -> page file names to leave out
+Fetched = List[Tuple[str, str, bytes]]  # [(file name, extension, bytes)] in reading order
+
 
 def fetch_image(url: str) -> bytes:
     try:
@@ -218,17 +224,49 @@ def fetch_image(url: str) -> bytes:
         return api.fetch(api.fallback_url(url), retries=3, timeout=60)
 
 
+def _cache_path(chapter_id: str, url: str) -> str:
+    quality = "saver" if "/data-saver/" in url else "data"
+    return os.path.join(PAGE_CACHE, chapter_id, quality, os.path.basename(url))
+
+
+def fetch_page(chapter_id: str, url: str, keep: bool = False) -> bytes:
+    """One chapter page — from the local cache if the review step already fetched it.
+    `keep` stores it there so the bind that follows a review doesn't download it again."""
+    path = _cache_path(chapter_id, url)
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        pass
+    data = fetch_image(url)
+    if keep:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "wb") as f:
+            f.write(data)
+        os.replace(path + ".tmp", path)
+    return data
+
+
+def cached_page_path(chapter_id: str, filename: str, data_saver: bool) -> str:
+    return os.path.join(PAGE_CACHE, chapter_id, "saver" if data_saver else "data", os.path.basename(filename))
+
+
+def drop_page_cache(chapter_ids: List[str]) -> None:
+    for cid in chapter_ids:
+        shutil.rmtree(os.path.join(PAGE_CACHE, os.path.basename(cid)), ignore_errors=True)
+
+
 def download_chapter_pages(c: Chapter, *, data_saver: bool = False, workers: int = 4,
                            on_page: Optional[PageCallback] = None,
-                           cancel: Optional[threading.Event] = None) -> List[Tuple[str, bytes]]:
-    """Returns [(extension, image bytes)] in reading order."""
+                           cancel: Optional[threading.Event] = None) -> Fetched:
+    """Returns [(file name, extension, image bytes)] in reading order."""
     urls = api.get_page_urls(c["id"], data_saver)
     total = len(urls)
     results: List[Optional[bytes]] = [None] * total
     done = 0
     ex = ThreadPoolExecutor(max_workers=workers)
     try:
-        pending = {ex.submit(fetch_image, u): i for i, u in enumerate(urls)}
+        pending = {ex.submit(fetch_page, c["id"], u): i for i, u in enumerate(urls)}
         while pending:
             if cancel is not None and cancel.is_set():
                 raise Cancelled()
@@ -241,15 +279,45 @@ def download_chapter_pages(c: Chapter, *, data_saver: bool = False, workers: int
                     on_page(c, done, total, i, os.path.splitext(urls[i])[1] or ".jpg", results[i])  # type: ignore[arg-type]
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
-    exts = [os.path.splitext(u)[1] or ".jpg" for u in urls]
-    return list(zip(exts, results))  # type: ignore[arg-type]
+    names = [os.path.basename(u) for u in urls]
+    return [(n, os.path.splitext(n)[1] or ".jpg", d) for n, d in zip(names, results)]  # type: ignore[misc]
+
+
+def find_ads(fetched: List[Tuple[Chapter, Fetched]],
+             blocklist: Optional[adfilter.Blocklist] = None) -> RemoveMap:
+    """Run the ad detector over a job's pages. Only confident hits ('ad') are returned —
+    'maybe' pages are left in unless the user removes them in the review step."""
+    if not adfilter.HAS_PIL:
+        return {}
+    pages: List[adfilter.Page] = []
+    refs: Dict[str, Any] = {}
+    for c, pgs in fetched:
+        n = len(pgs)
+        for i, (name, _, data) in enumerate(pgs):  # every page: ad blocks can run deep into a chapter
+            pages.append(adfilter.Page(c["id"], i, n, name, adfilter.fingerprint(data)))
+    names = {(p.chapter_id, p.index): p.filename for p in pages}
+    out: RemoveMap = {}
+    for key, (verdict, _) in adfilter.analyze(pages, blocklist, refs).items():
+        if verdict == "ad":
+            out.setdefault(key[0], set()).add(names[key])
+    return out
 
 
 def run_job(job: Job, series: Series, *, lang: str = "en", data_saver: bool = False,
             workers: int = 4, on_page: Optional[PageCallback] = None,
-            cancel: Optional[threading.Event] = None, out_root: Optional[str] = None) -> int:
-    """Download every chapter in `job` and write its .cbz. Returns pages written."""
-    count = 0
+            cancel: Optional[threading.Event] = None, out_root: Optional[str] = None,
+            clean: bool = False, remove: Optional[RemoveMap] = None,
+            blocklist: Optional[adfilter.Blocklist] = None) -> int:
+    """Download every chapter in `job` and write its .cbz. Returns pages written.
+
+    `remove` (pages the user picked in the review step) wins; otherwise, with `clean`, pages the
+    detector is confident are credits/ads are left out. `job.removed` gets the count."""
+    fetched = [(c, download_chapter_pages(c, data_saver=data_saver, workers=workers,
+                                          on_page=on_page, cancel=cancel)) for c in job.chapters]
+    if remove is None and clean:
+        remove = find_ads(fetched, blocklist)
+    remove = remove or {}
+    count = removed = 0
     groups = sorted({g for c in job.chapters for g in api.group_names(c)})
     with CbzWriter(job.path) as w:
         single = job.volume is None
@@ -260,10 +328,14 @@ def run_job(job: Job, series: Series, *, lang: str = "en", data_saver: bool = Fa
                 count += 1
             except Exception:
                 pass  # a missing cover shouldn't sink the volume
-        for ci, c in enumerate(job.chapters, 1):
-            pages = download_chapter_pages(c, data_saver=data_saver, workers=workers,
-                                           on_page=on_page, cancel=cancel)
-            for pi, (ext, data) in enumerate(pages, 1):
+        for ci, (c, pages) in enumerate(fetched, 1):
+            drop = remove.get(c["id"], set())
+            pi = 0
+            for name, ext, data in pages:
+                if name in drop:
+                    removed += 1
+                    continue
+                pi += 1
                 w.add(f"{pi:03d}{ext}" if single else f"{ci:03d}-{pi:03d}{ext}", data)
                 count += 1
         if single:
@@ -284,7 +356,9 @@ def run_job(job: Job, series: Series, *, lang: str = "en", data_saver: bool = Fa
                 translator=", ".join(groups), language=lang, page_count=count,
                 web=f"https://mangadex.org/title/{series.id}", year=series.year)
         w.add_text("ComicInfo.xml", info)
+    job.removed = removed
     record_download(series, job, count)
+    drop_page_cache([c["id"] for c in job.chapters])
     return count
 
 

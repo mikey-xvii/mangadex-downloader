@@ -263,9 +263,21 @@ def iter_chapters(manga_id: str, langs: Iterable[str]) -> List[Dict[str, Any]]:
             if not c["attributes"].get("externalUrl") and c["attributes"].get("pages", 0) > 0]
 
 
+_athome_cache: Dict[str, Any] = {}
+_athome_lock = threading.Lock()
+
+
 def get_page_urls(chapter_id: str, data_saver: bool = False) -> List[str]:
-    """Ask MangaDex@Home for a server and build the image URLs for one chapter."""
-    data = get_json(f"/at-home/server/{chapter_id}", limiter=_athome_limiter)
+    """Ask MangaDex@Home for a server and build the image URLs for one chapter. Answers are
+    reused for 10 minutes (the lookup is limited to 40/min; a review + bind would need two)."""
+    with _athome_lock:
+        hit = _athome_cache.get(chapter_id)
+    if hit and time.time() - hit[0] < 600:
+        data = hit[1]
+    else:
+        data = get_json(f"/at-home/server/{chapter_id}", limiter=_athome_limiter)
+        with _athome_lock:
+            _athome_cache[chapter_id] = (time.time(), data)
     base = data["baseUrl"]
     ch = data["chapter"]
     quality, files = ("data-saver", ch["dataSaver"]) if data_saver else ("data", ch["data"])

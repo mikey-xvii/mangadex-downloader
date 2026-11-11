@@ -26,6 +26,7 @@ function h(tag, props, ...kids) {
 }
 
 const ICONS = {
+  sparkle: '<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.7 1.8 1.8.7-1.8.7L19 20l-.7-1.8-1.8-.7 1.8-.7z"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
   arrow: '<path d="M5 12h14M13 6l6 6-6 6"/>',
   phone: '<rect x="6" y="2.5" width="12" height="19" rx="3"/><path d="M10.5 18.5h3"/>',
@@ -108,7 +109,8 @@ const S = {
   stragglers: [],
   volBy: new Map(),
   vprog: new Map(),          // volume -> 0..1 while it's being bound
-  opts: { lang: 'en', group: '', dataSaver: !!store('dataSaver') },
+  opts: { lang: 'en', group: '', dataSaver: !!store('dataSaver'), clean: store('clean') ?? true },
+  ads: { available: false, learned: 0 },
   speed: [],                 // [{t, bytes}] samples
   accent: [255, 90, 54],
   accentTarget: [255, 90, 54],
@@ -541,7 +543,10 @@ function renderToolbar() {
   tb.replaceChildren(
     h('div', { class: 'field' }, h('span', { class: 'lbl' }, 'Lang'), langSel),
     h('div', { class: 'field', title: 'When several groups translated a chapter, which one to use' }, h('span', { class: 'lbl' }, 'Group'), groupSel),
-    ds, h('span', { class: 'grow' }),
+    ds,
+    h('label', { class: `switch ${S.ads.available ? '' : 'off'}`, title: S.ads.available ? 'Automatically strip scanlator credit / recruitment / ad pages when binding (use Review pages to check first)' : 'Needs Pillow: pip install pillow' },
+      h('input', { type: 'checkbox', checked: S.opts.clean && S.ads.available, disabled: !S.ads.available, onchange: (e) => { S.opts.clean = e.target.checked; store('clean', S.opts.clean); } }), h('i'), 'Strip ads'),
+    h('span', { class: 'grow' }),
     h('button', { class: 'btn sm ghost', title: 'Show the library folder in Finder', onclick: () => post('/api/reveal', { path: '' }) }, icon('folder'), h('span', { class: 'dl-dir' }, S.outDir)));
 }
 
@@ -763,13 +768,14 @@ function updateBindbar() {
       h('small', {}, [`${pages.toLocaleString()} pages`, `≈${fmtBytes(pages * per)}`, have ? `${have} already on shelf` : null, gappy ? `${gappy} with missing chapters` : null].filter(Boolean).join(' · '))),
     h('span', { class: 'sp' }),
     h('button', { class: 'btn ghost sm', onclick: () => { S.sel.clear(); paint(); } }, 'Clear'),
+    S.ads.available ? h('button', { class: 'btn review-btn', title: 'Check the first and last pages of each chapter for credit / ad pages before binding', onclick: openProof }, icon('sparkle'), 'Review pages') : null,
     h('button', { class: 'bind-btn', onclick: bind }, h('span', { class: 'seal' }, '製'), 'BIND', icon('arrow')));
 }
 async function bind(e) {
   const btn = e.currentTarget; btn.disabled = true;
   const vols = S.vols.filter((v) => S.sel.has(v.volume)).map((v) => v.volume);
   try {
-    const r = await post('/api/download', { manga_id: S.manga.id, volumes: vols, lang: S.opts.lang, data_saver: S.opts.dataSaver, group: S.opts.group });
+    const r = await post('/api/download', { manga_id: S.manga.id, volumes: vols, lang: S.opts.lang, data_saver: S.opts.dataSaver, group: S.opts.group, clean: S.opts.clean && S.ads.available });
     flyToPress(vols.map((v) => S.volCards.get(v)).filter(Boolean));
     if (r.tasks.length) toast(`${r.tasks.length} volume${r.tasks.length === 1 ? '' : 's'} sent to the press${r.skipped.length ? ` · ${r.skipped.length} already bound` : ''}`);
     else toast('Those volumes are already on your shelf');
@@ -873,7 +879,7 @@ function renderPress() {
   list.replaceChildren(...tasks.slice().sort((a, b) => order[a.status] - order[b.status] || b.finished - a.finished).slice(0, 60).map((t) => {
     const st = t.status === 'running' ? `${t.current || 'starting'} · ${t.pages_done}/${t.pages_total}`
       : t.status === 'queued' ? `queued · ${t.pages_total} pages`
-      : t.status === 'done' ? `✓ ${t.pages_total} page${t.pages_total === 1 ? '' : 's'} · ${fmtBytes(t.bytes)}`
+      : t.status === 'done' ? `✓ ${t.pages_total} page${t.pages_total === 1 ? '' : 's'} · ${fmtBytes(t.bytes)}${t.removed ? ` · ${t.removed} ad${t.removed === 1 ? '' : 's'} stripped` : ''}`
       : t.status === 'error' ? t.error : 'cancelled';
     const acts = t.status === 'done'
       ? [h('button', { class: 'mini', title: 'Read', onclick: () => openReader(t.file, t.name) }, icon('read')), h('button', { class: 'mini', title: 'Show in Finder', onclick: () => post('/api/reveal', { path: t.file }) }, icon('folder'))]
@@ -903,12 +909,233 @@ function stamp() {
   setTimeout(() => s.remove(), 1700);
 }
 
+// ================================================================ proofing room: review credit/ad pages before binding
+// The server scans just the first/last pages of every chapter in the selected volumes and streams
+// verdicts back; you flip anything it got wrong, then bind. Choices teach the learned blocklist.
+const P = { rv: null, el: null, over: new Map(), cards: new Map(), onlyFlagged: true, remember: true, removing: 0, loupeTimer: 0 };
+const pkey = (cid, fn) => `${cid}/${fn}`;
+function decision(cid, p) {
+  return P.over.get(pkey(cid, p.filename)) ?? (p.verdict === 'ad' ? 'remove' : 'keep');
+}
+function volsLabel(vols) {
+  if (!vols.length) return '';
+  const nums = vols.map(Number);
+  const contiguous = nums.every((n, i) => !isNaN(n) && (i === 0 || n === nums[i - 1] + 1));
+  return vols.length === 1 ? `Vol. ${vols[0]}` : contiguous ? `Vol. ${vols[0]}–${vols[vols.length - 1]}` : `${vols.length} volumes`;
+}
+
+async function openProof() {
+  const vols = S.vols.filter((v) => S.sel.has(v.volume)).map((v) => v.volume);
+  if (!vols.length) return;
+  Object.assign(P, { over: new Map(), cards: new Map(), onlyFlagged: true, remember: store('rememberAds') ?? true, rv: null });
+  buildProof(vols);
+  try {
+    P.rv = await post('/api/review', { manga_id: S.manga.id, volumes: vols, lang: S.opts.lang, data_saver: S.opts.dataSaver, group: S.opts.group });
+    renderProof();
+  } catch (e) { toast(e.message, 'error'); closeProof(false); }
+}
+function closeProof(cancel = true) {
+  if (cancel && P.rv?.status === 'running') post(`/api/review/${P.rv.id}/cancel`).catch(() => {});
+  const el = P.el;
+  P.el = null; P.rv = null;
+  hideLoupe();
+  removeEventListener('keydown', proofKeys);
+  document.body.style.overflow = '';
+  if (el) { el.classList.add('out'); setTimeout(() => el.remove(), 380); }
+}
+function proofKeys(e) {
+  if (e.key === 'Escape') { e.stopPropagation(); closeProof(); }
+  if (e.key === 'Enter' && P.rv?.status === 'done' && !e.target.closest?.('button')) $('.proof-bind', P.el)?.click();
+}
+
+function buildProof(vols) {
+  const seg = h('div', { class: 'seg' });
+  const thumb = h('span', { class: 'thumb' });
+  const mk = (val, label) => h('button', { class: P.onlyFlagged === val ? 'on' : '', onclick: (e) => { P.onlyFlagged = val; $$('button', seg).forEach((b) => b.classList.toggle('on', b === e.currentTarget)); moveThumb(); renderProof(); } }, label);
+  seg.append(thumb, mk(true, 'Flagged'), mk(false, 'Every chapter'));
+  const moveThumb = () => requestAnimationFrame(() => { const on = $('button.on', seg); if (on) { thumb.style.left = on.offsetLeft + 'px'; thumb.style.width = on.offsetWidth + 'px'; } });
+  const remember = h('label', { class: 'switch', title: 'Pages you remove are recognised and removed automatically next time, in any series' },
+    h('input', { type: 'checkbox', checked: P.remember, onchange: (e) => { P.remember = e.target.checked; store('rememberAds', P.remember); } }), h('i'), 'Remember my choices');
+  const el = h('div', { class: 'proof', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Review pages before binding', onclick: (e) => { if (e.target === el) closeProof(); } },
+    h('div', { class: 'proof-sheet' },
+      h('header', { class: 'proof-head' },
+        h('div', { class: 'proof-title' },
+          h('div', { class: 'eyebrow' }, h('span', {}, 'Proofing room'), h('span', {}, '校正')),
+          h('h2', {}, 'Strip the ads before binding'),
+          h('p', { class: 'proof-sub' }, `${S.manga.title} · ${volsLabel(vols)}`)),
+        h('div', { class: 'proof-stats' }),
+        h('button', { class: 'mini x', 'aria-label': 'Close review', onclick: () => closeProof() }, icon('x'))),
+      h('div', { class: 'proof-scan' }, h('i')),
+      h('div', { class: 'proof-tools' },
+        h('span', { class: 'proof-status' }, 'Starting…'),
+        h('span', { class: 'proof-legend' },
+          h('span', {}, h('i', { class: 'lg-ad' }), 'removed'),
+          h('span', {}, h('i', { class: 'lg-maybe' }), 'worth a look'),
+          h('span', {}, h('i', { class: 'lg-keep' }), 'kept')),
+        h('span', { style: { flex: 1 } }), seg),
+      h('div', { class: 'proof-body' }),
+      h('footer', { class: 'proof-foot' },
+        remember,
+        h('span', { class: 'proof-learned' }),
+        h('span', { style: { flex: 1 } }),
+        h('button', { class: 'btn ghost', onclick: () => closeProof() }, 'Cancel'),
+        h('button', { class: 'bind-btn proof-bind', disabled: true, onclick: bindReviewed }, h('span', { class: 'seal' }, '製'), h('span', { class: 'lbl' }, 'BIND'), icon('arrow')))));
+  document.body.append(el);
+  document.body.style.overflow = 'hidden';
+  P.el = el;
+  moveThumb();
+  addEventListener('keydown', proofKeys);
+  renderLearned();
+}
+
+function renderLearned() {
+  const box = $('.proof-learned', P.el); if (!box) return;
+  const n = S.ads.learned || 0;
+  box.replaceChildren(n ? h('span', {}, `${n} page${n === 1 ? '' : 's'} learned · `, h('button', { class: 'linkish', onclick: async () => { await post('/api/blocklist/clear'); S.ads.learned = 0; renderLearned(); toast('Forgot every learned ad page'); } }, 'forget')) : '');
+}
+
+function pageCard(ch, p) {
+  const k = pkey(ch.id, p.filename);
+  let c = P.cards.get(k);
+  if (!c) {
+    c = h('button', { class: 'pcard', onclick: () => togglePage(ch.id, p.filename) },
+      h('img', { src: p.img, alt: `${ch.label} page ${p.index + 1}`, loading: 'lazy', decoding: 'async' }),
+      h('span', { class: 'pslash' }),
+      h('span', { class: 'pstamp' }, '除'),
+      h('span', { class: 'pno' }, `p.${p.index + 1}`),
+      h('span', { class: 'pwhy' }));
+    c.addEventListener('animationend', () => c.classList.add('seen'), { once: true });
+    c.addEventListener('pointerenter', () => { clearTimeout(P.loupeTimer); P.loupeTimer = setTimeout(() => showLoupe(c, p.img), 380); });
+    c.addEventListener('pointerleave', hideLoupe);
+    P.cards.set(k, c);
+  }
+  const d = decision(ch.id, p);
+  const flipped = P.over.has(k);
+  c.classList.toggle('remove', d === 'remove');
+  c.classList.toggle('maybe', p.verdict === 'maybe' && d !== 'remove');
+  c.classList.toggle('flagged', p.verdict === 'ad');
+  c.classList.toggle('mine', flipped);
+  const why = d === 'remove' ? (flipped ? 'removed by you' : p.reason) : p.verdict === 'maybe' ? p.reason : p.verdict === 'ad' ? 'kept by you' : (p.reason || '');
+  $('.pwhy', c).textContent = why;
+  c.title = `${ch.label} · page ${p.index + 1} of ${ch.total}${p.w ? ` · ${p.w}×${p.h}` : ''}\n${d === 'remove' ? 'Will be removed' : 'Will be kept'} — click to ${d === 'remove' ? 'keep' : 'remove'}`;
+  c.setAttribute('aria-pressed', String(d === 'remove'));
+  return c;
+}
+function togglePage(cid, fn) {
+  const ch = P.rv?.chapters.find((x) => x.id === cid);
+  const p = ch?.pages.find((x) => x.filename === fn);
+  if (!p) return;
+  const k = pkey(cid, fn);
+  const def = p.verdict === 'ad' ? 'remove' : 'keep';
+  const next = decision(cid, p) === 'remove' ? 'keep' : 'remove';
+  next === def ? P.over.delete(k) : P.over.set(k, next);
+  renderProof();
+}
+
+function showLoupe(card, src) {
+  hideLoupe();
+  const r = card.getBoundingClientRect();
+  const lp = h('div', { class: 'loupe' }, h('img', { src, alt: '' }));
+  const w = Math.min(460, innerWidth * .36);
+  const left = r.right + 16 + w < innerWidth ? r.right + 16 : Math.max(12, r.left - 16 - w);
+  Object.assign(lp.style, { left: left + 'px', width: w + 'px' });
+  document.body.append(lp);
+}
+function hideLoupe() { clearTimeout(P.loupeTimer); $$('.loupe').forEach((x) => x.remove()); }
+
+function renderProof() {
+  const rv = P.rv, el = P.el;
+  if (!rv || !el) return;
+  let detected = 0, maybes = 0, removing = 0, checked = 0;
+  for (const ch of rv.chapters) for (const p of ch.pages) {
+    checked++;
+    if (p.verdict === 'ad') detected++;
+    if (p.verdict === 'maybe') maybes++;
+    if (decision(ch.id, p) === 'remove') removing++;
+  }
+  const prev = P.removing;
+  P.removing = removing;
+  const running = rv.status === 'running';
+  const n = $('.proof-stats', el);
+  n.replaceChildren(
+    h('div', { class: `pstat ${removing !== prev ? 'bump' : ''}` }, h('b', {}, removing), h('small', {}, `page${removing === 1 ? '' : 's'} to remove`)),
+    h('div', { class: 'pstat dim' }, h('b', {}, maybes), h('small', {}, 'worth a look')));
+  const within = rv.page_total ? rv.page_done / rv.page_total : 0;
+  $('.proof-scan', el).style.setProperty('--p', rv.total ? Math.min(1, (rv.done + (running ? within : 0)) / rv.total) : 0);
+  $('.proof-scan', el).classList.toggle('running', running);
+  const allPages = rv.chapters.reduce((a, ch) => a + ch.total, 0);
+  $('.proof-status', el).textContent = running ? `Reading chapter ${Math.min(rv.done + 1, rv.total)} of ${rv.total}${rv.page_total ? ` · page ${rv.page_done}/${rv.page_total}` : ''}…`
+    : rv.status === 'error' ? `Scan failed: ${rv.error}` : rv.status === 'cancelled' ? 'Scan stopped'
+    : `Checked all ${allPages} pages across ${rv.total} chapter${rv.total === 1 ? '' : 's'}`;
+
+  const visible = rv.chapters.filter((ch) => !P.onlyFlagged || ch.pages.some((p) => p.verdict !== 'keep' || P.over.has(pkey(ch.id, p.filename))));
+  const body = $('.proof-body', el);
+  const frag = [];
+  let curVol, volBox;
+  for (const ch of visible) {
+    if (!volBox || ch.volume !== curVol) {
+      curVol = ch.volume;
+      volBox = h('section', { class: 'pvol' }, h('h3', {}, ch.volume ? `Vol. ${ch.volume}` : 'No volume'));
+      frag.push(volBox);
+    }
+    // Pages arrive with holes where the story is; show each hole as an "N story pages" gap.
+    const strip = [];
+    let prev = -1;
+    for (const p of [...ch.pages].sort((a, b) => a.index - b.index)) {
+      const skipped = p.index - prev - 1;
+      if (skipped > 0) strip.push(h('span', { class: 'pgap' }, h('i'), h('b', {}, skipped), h('small', {}, skipped === 1 ? 'story page' : 'story pages'), h('i')));
+      strip.push(pageCard(ch, p));
+      prev = p.index;
+    }
+    if (ch.total - 1 > prev) strip.push(h('span', { class: 'pgap' }, h('i'), h('b', {}, ch.total - 1 - prev), h('small', {}, 'story pages'), h('i')));
+    const nAds = ch.pages.filter((p) => decision(ch.id, p) === 'remove').length;
+    volBox.append(h('div', { class: 'prow' },
+      h('div', { class: 'prow-label' }, h('b', {}, ch.label), h('small', {}, `${ch.total} pages`), nAds ? h('small', { class: 'prow-ads' }, `−${nAds}`) : null),
+      h('div', { class: 'prow-pages' }, strip)));
+  }
+  if (!frag.length) {
+    frag.push(running
+      ? h('div', { class: 'proof-empty' }, h('span', { class: 'seal big spin' }, '校'), h('b', {}, 'Reading every page…'), h('small', {}, 'Suspicious pages appear here the moment they’re spotted. Pages read now are reused when you bind.'))
+      : h('div', { class: 'proof-empty' }, h('span', { class: 'seal big ok' }, '清'), h('b', {}, rv.status === 'done' ? 'Clean! No credit or ad pages found.' : 'Nothing to show.'),
+        h('small', {}, 'Switch to “Every chapter” to double-check, or bind straight away.')));
+  }
+  body.replaceChildren(...frag);
+
+  const btn = $('.proof-bind', el);
+  btn.disabled = rv.status !== 'done';
+  const nv = rv.volumes.length;
+  $('.lbl', btn).textContent = running ? 'SCANNING…' : `BIND ${nv} VOL${nv === 1 ? '' : 'S'}${removing ? ` · −${removing}` : ''}`;
+}
+
+async function bindReviewed(e) {
+  const rv = P.rv; if (!rv) return;
+  const btn = e.currentTarget; btn.disabled = true;
+  const remove = {}, keep = {};
+  for (const ch of rv.chapters) for (const p of ch.pages) {
+    const d = decision(ch.id, p);
+    if (d === 'remove') (remove[ch.id] ||= []).push(p.filename);
+    else if (p.verdict === 'ad') (keep[ch.id] ||= []).push(p.filename);
+  }
+  try {
+    const r = await post('/api/download', { manga_id: rv.manga_id, volumes: rv.volumes, lang: S.opts.lang, data_saver: S.opts.dataSaver, group: S.opts.group, review_id: rv.id, remove, keep, remember: P.remember });
+    S.ads.learned = (S.ads.learned || 0) + (r.learned || 0);
+    const removed = P.removing;
+    flyFrom(btn);
+    closeProof(false);
+    toast(r.tasks.length
+      ? `${r.tasks.length} volume${r.tasks.length === 1 ? '' : 's'} sent to the press${removed ? ` · ${removed} ad page${removed === 1 ? '' : 's'} stripped` : ''}${r.learned ? ` · learned ${r.learned}` : ''}`
+      : 'Those volumes are already on your shelf');
+    S.sel.clear(); paint();
+  } catch (err) { toast(err.message, 'error'); btn.disabled = false; }
+}
+
 // ================================================================ live events from the server
 function connectEvents() {
   const es = new EventSource('/api/events');
   es.onmessage = (e) => {
     let ev; try { ev = JSON.parse(e.data); } catch { return; }
-    if (ev.type === 'queued') { ev.tasks.forEach((t) => S.tasks.set(t.id, t)); updatePress(); }
+    if (ev.type === 'review') { if (P.rv && ev.review.id === P.rv.id) { P.rv = ev.review; renderProof(); } }
+    else if (ev.type === 'queued') { ev.tasks.forEach((t) => S.tasks.set(t.id, t)); updatePress(); }
     else if (ev.type === 'task') {
       const t = ev.task; S.tasks.set(t.id, t);
       if (t.status !== 'running' && t.volume) S.vprog.delete(t.volume);
@@ -1173,6 +1400,7 @@ addEventListener('keydown', (e) => {
     const st = await get('/api/state');
     S.me = { logged_in: st.logged_in, username: st.username };
     S.outDir = st.out_dir;
+    S.ads = st.ads || S.ads;
     st.tasks.forEach((t) => S.tasks.set(t.id, t));
   } catch {}
   renderAccount(); updatePress();

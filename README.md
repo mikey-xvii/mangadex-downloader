@@ -4,7 +4,7 @@ Paste a [MangaDex](https://mangadex.org) link and get **one `.cbz` per volume**.
 that volume's own cover as its first page plus `ComicInfo.xml` metadata, ready to AirDrop to
 your phone's comic reader (Panels, Chunky, Komik…).
 
-Pure Python standard library, nothing to install (Python 3.8+).
+Python 3.8+ standard library. Pillow is optional and turns on ad-page filtering.
 
 ## The web app
 
@@ -20,6 +20,9 @@ That opens `http://localhost:8787`. From there:
   a run, or drag across the chapter strip (one bar per chapter, grouped by volume).
   - Volumes already on your shelf are marked.
   - Volumes with holes in their chapter list show a ⚠ "missing ch. …" warning before you bind.
+- **Review pages** (optional): open the proofing room before binding. It reads every page,
+  stamps the credit/recruitment/"join our Discord" pages it
+  finds with 除, and lets you flip anything it got wrong. See *Ad & credit pages* below.
 - **Bind**: watch the press. Pages fly in live, the volume cover fills with ink as it downloads,
   and you get speed and an ETA.
 - **Shelf**: everything you've bound, as 3D books. Read any volume in the built-in reader
@@ -29,6 +32,36 @@ That opens `http://localhost:8787`. From there:
   and your custom lists.
 
 Options: `serve --port 8787 --out ./downloads --no-open`. It only listens on `127.0.0.1`.
+
+### Ad & credit pages
+
+Scanlation groups often add credits, recruitment ("join our Discord") or promo pages to
+chapters, sometimes a whole block of them. They're removed automatically when you bind (the
+**Strip ads** switch; `--keep-ads` on the command line turns it off). Every page is
+fingerprinted (perceptual hash, pixel size, colour). Then:
+
+- **Ad-like pages are removed.** A page is ad-like if it's nearly identical to a page in another
+  chapter (groups reuse one template and only change the chapter number), or if you removed it
+  before.
+- **Whole blocks at the start or end are caught.** From each end of a chapter it walks inward
+  while pages are ad-like or *foreign* (a different size from the chapter's usual page, or colour
+  in a black-and-white chapter), and stops at the first normal page. One series had a six-page
+  promo block at the end of every chapter. Inside a volume those blocks sit in the middle of the
+  book, so the walk matters there too.
+- **Foreign alone is never enough.** A page that's only foreign is marked "worth a look" in the
+  review, and never removed on its own. A lone colour chapter opener isn't flagged at all.
+- **Inside a chapter,** learned pages are removed, and repeated pages are removed if they're also
+  foreign.
+- **Near-blank pages are always kept.** Logo pages and interludes are part of the real book.
+- **Learned pages are kept in** `~/.config/mangadex-dl/blocklist.json` and recognised in any
+  series. Keep a page in the review and it's forgotten again.
+
+**Review pages** shows all of this before you bind. It reads every page and shows only the
+flagged ones in place, with a count of the story pages between them. The bind afterwards reuses
+those pages, so it takes seconds. Tested on two series: one with a 7-chapter volume carrying
+36 promo / credit pages (including six-page blocks at chapter ends), and The Girl From the
+Other Side Vol. 1–2 (7 credits pages). All were removed and no story pages were lost. This needs Pillow (`pip install pillow`;
+Anaconda already has it). Without Pillow the filter turns itself off.
 
 ### Chapters that aren't in a volume yet
 
@@ -69,6 +102,7 @@ python3 -m mangadex_dl https://mangadex.org/title/<id> --volumes 1-3
 | `-l, --lang en,es-la` | translation language(s), default `en` |
 | `-g, --group NAME` | prefer a scanlation group (substring match) |
 | `--loose` | also bind chapters that aren't in a volume yet, one file each |
+| `--keep-ads` | don't remove scanlator credit/recruitment pages |
 | `-b chapter` | one file per chapter instead of per volume |
 | `-c, --chapters 1-10` | filter by chapter number |
 | `-o, --out DIR` | output folder, default `./downloads` |
@@ -102,6 +136,7 @@ and open it in your reader.
 mangadex_dl/
   api.py      MangaDex API client (rate limiting, retries, covers)
   engine.py   chapter selection, volume planning, downloading, .cbz writing
+  adfilter.py credit/ad page detection + learned blocklist
   cbz.py      zip + ComicInfo.xml
   auth.py     personal-client login and token refresh
   server.py   local web app: JSON API + live progress over Server-Sent Events

@@ -3,3 +3,4 @@ __pycache__/
 *.egg-info/
 *.cbz.part
 .venv/
+.DS_Store

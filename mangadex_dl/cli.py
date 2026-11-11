@@ -10,7 +10,7 @@ import sys
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
-from . import api, engine
+from . import adfilter, api, engine
 from .engine import Series, chapter_label
 
 Chapter = Dict[str, Any]
@@ -36,6 +36,10 @@ def run_downloads(series: Series, chapters: List[Chapter], args,
         print("Nothing to bind.")
         return 0
     stats: Counter = Counter()
+    clean = not args.keep_ads and adfilter.HAS_PIL
+    blocklist = adfilter.Blocklist() if clean else None
+    if not args.keep_ads and not adfilter.HAS_PIL:
+        print("(Ad-page filtering is off: install Pillow to enable it — pip install pillow)")
     print(f"Saving to {series.folder(args.out)}")
     for n, job in enumerate(jobs, 1):
         prefix = f"[{n}/{len(jobs)}] {os.path.basename(job.path)}:"
@@ -49,8 +53,10 @@ def run_downloads(series: Series, chapters: List[Chapter], args,
             print(f"\r{prefix}{sub} page {done}/{total}", end="", flush=True)
         try:
             count = engine.run_job(job, series, lang=lang, data_saver=args.data_saver,
-                                   workers=args.workers, on_page=on_page)
-            print(f"\r{prefix} {count} pages ✓" + " " * 20)
+                                   workers=args.workers, on_page=on_page,
+                                   clean=clean, blocklist=blocklist)
+            extra = f" ({job.removed} credit/ad page{'s' if job.removed != 1 else ''} removed)" if job.removed else ""
+            print(f"\r{prefix} {count} pages ✓{extra}" + " " * 20)
             stats["downloaded"] += 1
         except KeyboardInterrupt:
             print("\nInterrupted. Partial file removed; re-run to resume.")
@@ -122,6 +128,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also bind chapters that aren't in a volume yet (one file each)")
     p.add_argument("-o", "--out", default="downloads", help="output folder (default: ./downloads)")
     p.add_argument("--data-saver", action="store_true", help="smaller, compressed images")
+    p.add_argument("--keep-ads", action="store_true",
+                   help="don't remove scanlator credit/recruitment pages (removed by default)")
     p.add_argument("--list", action="store_true", help="list chapters and exit")
     p.add_argument("-y", "--yes", action="store_true", help="take the first search result")
     p.add_argument("-f", "--force", action="store_true", help="re-download existing files")
