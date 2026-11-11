@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mangadex-dl"
+version = "0.1.0"
+description = "Download manga from MangaDex as .cbz files"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+mangadex-dl = "mangadex_dl.cli:main"
+
+[tool.setuptools]
+packages = ["mangadex_dl"]
